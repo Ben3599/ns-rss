@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -22,6 +23,8 @@ import (
 const (
 	defaultHTTPListen  = ":80"
 	defaultHTTPSListen = ":443"
+	defaultConfigPath  = "config.yaml"
+	defaultLogLevel    = "info"
 	defaultHTTPPort    = "80"
 	defaultHTTPSPort   = "443"
 	maxHTTPHeaderSize  = 64 * 1024
@@ -29,23 +32,66 @@ const (
 	maxTLSRecordSize   = 18 * 1024
 )
 
+type logLevel int
+
+const (
+	levelDebug logLevel = iota
+	levelInfo
+	levelWarn
+	levelError
+)
+
 var (
 	errNoServerName = errors.New("server name was not found")
 	errNeedMoreData = errors.New("more data is required")
+	appLog          = leveledLogger{level: levelInfo}
 )
 
 type closeWriter interface {
 	CloseWrite() error
 }
 
+type config struct {
+	LogLevel logLevel
+}
+
+type leveledLogger struct {
+	level logLevel
+}
+
+func (l leveledLogger) Debugf(format string, args ...any) {
+	if l.level <= levelDebug {
+		log.Printf("DEBUG "+format, args...)
+	}
+}
+
+func (l leveledLogger) Infof(format string, args ...any) {
+	if l.level <= levelInfo {
+		log.Printf("INFO "+format, args...)
+	}
+}
+
+func (l leveledLogger) Errorf(format string, args ...any) {
+	if l.level <= levelError {
+		log.Printf("ERROR "+format, args...)
+	}
+}
+
 func main() {
 	httpListen := flag.String("http-listen", defaultHTTPListen, "HTTP listen address")
 	httpsListen := flag.String("https-listen", defaultHTTPSListen, "HTTPS listen address")
+	configPath := flag.String("config", defaultConfigPath, "YAML configuration file path")
 	dialTimeout := flag.Duration("dial-timeout", 10*time.Second, "upstream dial timeout")
 	readTimeout := flag.Duration("read-timeout", 10*time.Second, "initial client read timeout")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	cfg, err := loadConfig(*configPath, wasFlagSet("config"))
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+	appLog = leveledLogger{level: cfg.LogLevel}
 
 	httpListener, err := net.Listen("tcp", *httpListen)
 	if err != nil {
@@ -66,14 +112,154 @@ func main() {
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 
-	log.Printf("HTTP proxy is listening on %s", *httpListen)
-	log.Printf("HTTPS proxy is listening on %s", *httpsListen)
+	appLog.Infof("HTTP proxy is listening on %s", *httpListen)
+	appLog.Infof("HTTPS proxy is listening on %s", *httpsListen)
 
 	select {
 	case sig := <-signalCh:
-		log.Printf("Received signal %s, shutting down", sig)
+		appLog.Infof("Received signal %s, shutting down", sig)
 	case err := <-errCh:
-		log.Printf("Listener stopped: %v", err)
+		appLog.Errorf("Listener stopped: %v", err)
+	}
+}
+
+func wasFlagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+func defaultConfig() config {
+	level, err := parseLogLevel(defaultLogLevel)
+	if err != nil {
+		panic(err)
+	}
+	return config{LogLevel: level}
+}
+
+func loadConfig(path string, required bool) (config, error) {
+	cfg := defaultConfig()
+	if path == "" {
+		if required {
+			return cfg, errors.New("configuration file path is empty")
+		}
+		return cfg, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && !required {
+			return cfg, nil
+		}
+		return cfg, err
+	}
+
+	if strings.TrimSpace(string(data)) == "" {
+		return cfg, nil
+	}
+
+	return parseYAMLConfig(data)
+}
+
+func parseYAMLConfig(data []byte) (config, error) {
+	cfg := defaultConfig()
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 1024), 64*1024)
+
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(stripYAMLComment(scanner.Text()))
+		if line == "" || line == "---" || line == "..." {
+			continue
+		}
+
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return cfg, fmt.Errorf("invalid YAML line %d", lineNumber)
+		}
+
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return cfg, fmt.Errorf("missing value for %q on line %d", key, lineNumber)
+		}
+
+		var err error
+		switch key {
+		case "log_level":
+			cfg.LogLevel, err = parseLogLevel(unquoteYAMLScalar(value))
+		default:
+			return cfg, fmt.Errorf("unsupported configuration key %q on line %d", key, lineNumber)
+		}
+		if err != nil {
+			return cfg, fmt.Errorf("invalid value for %q on line %d: %w", key, lineNumber, err)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
+func stripYAMLComment(line string) string {
+	inSingleQuote := false
+	inDoubleQuote := false
+
+	for i, r := range line {
+		switch r {
+		case '\'':
+			if !inDoubleQuote {
+				inSingleQuote = !inSingleQuote
+			}
+		case '"':
+			if !inSingleQuote {
+				inDoubleQuote = !inDoubleQuote
+			}
+		case '#':
+			if !inSingleQuote && !inDoubleQuote && (i == 0 || line[i-1] == ' ' || line[i-1] == '\t') {
+				return line[:i]
+			}
+		}
+	}
+
+	return line
+}
+
+func unquoteYAMLScalar(value string) string {
+	if len(value) < 2 {
+		return value
+	}
+
+	if value[0] == '\'' && value[len(value)-1] == '\'' {
+		return strings.ReplaceAll(value[1:len(value)-1], "''", "'")
+	}
+	if value[0] == '"' && value[len(value)-1] == '"' {
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			return unquoted
+		}
+	}
+
+	return value
+}
+
+func parseLogLevel(value string) (logLevel, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "debug":
+		return levelDebug, nil
+	case "info":
+		return levelInfo, nil
+	case "warn", "warning":
+		return levelWarn, nil
+	case "error":
+		return levelError, nil
+	default:
+		return levelInfo, fmt.Errorf("supported values are debug, info, warn, and error")
 	}
 }
 
@@ -100,34 +286,34 @@ func handleHTTPConnection(client net.Conn, dialTimeout time.Duration, readTimeou
 	defer client.Close()
 
 	if err := client.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
-		log.Printf("Failed to set initial read deadline for %s: %v", client.RemoteAddr(), err)
+		appLog.Errorf("Failed to set initial read deadline for %s: %v", client.RemoteAddr(), err)
 		return
 	}
 
 	initial, err := readHTTPInitialBytes(client, maxHTTPHeaderSize)
 	if err != nil {
-		log.Printf("Failed to read HTTP request from %s: %v", client.RemoteAddr(), err)
+		appLog.Errorf("Failed to read HTTP request from %s: %v", client.RemoteAddr(), err)
 		return
 	}
 
 	if err := client.SetReadDeadline(time.Time{}); err != nil {
-		log.Printf("Failed to clear read deadline for %s: %v", client.RemoteAddr(), err)
+		appLog.Errorf("Failed to clear read deadline for %s: %v", client.RemoteAddr(), err)
 		return
 	}
 
 	authority, err := parseHTTPAuthority(initial)
 	if err != nil {
-		log.Printf("Failed to get HTTP host from %s: %v", client.RemoteAddr(), err)
+		appLog.Errorf("Failed to get HTTP host from %s: %v", client.RemoteAddr(), err)
 		return
 	}
 
 	target, serverName, err := buildTargetAddress(authority, defaultHTTPPort)
 	if err != nil {
-		log.Printf("Invalid HTTP host from %s: %v", client.RemoteAddr(), err)
+		appLog.Errorf("Invalid HTTP host from %s: %v", client.RemoteAddr(), err)
 		return
 	}
 
-	log.Printf("HTTP request from %s is routed to %s", client.RemoteAddr(), target)
+	appLog.Debugf("HTTP request from %s is routed to %s", client.RemoteAddr(), target)
 	proxyConnection(client, target, initial, serverName, dialTimeout)
 }
 
@@ -135,36 +321,36 @@ func handleHTTPSConnection(client net.Conn, dialTimeout time.Duration, readTimeo
 	defer client.Close()
 
 	if err := client.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
-		log.Printf("Failed to set initial read deadline for %s: %v", client.RemoteAddr(), err)
+		appLog.Errorf("Failed to set initial read deadline for %s: %v", client.RemoteAddr(), err)
 		return
 	}
 
 	serverName, initial, err := readTLSClientHello(client, maxTLSHelloSize)
 	if err != nil {
-		log.Printf("Failed to read TLS ClientHello from %s: %v", client.RemoteAddr(), err)
+		appLog.Errorf("Failed to read TLS ClientHello from %s: %v", client.RemoteAddr(), err)
 		return
 	}
 
 	if err := client.SetReadDeadline(time.Time{}); err != nil {
-		log.Printf("Failed to clear read deadline for %s: %v", client.RemoteAddr(), err)
+		appLog.Errorf("Failed to clear read deadline for %s: %v", client.RemoteAddr(), err)
 		return
 	}
 
 	target := net.JoinHostPort(serverName, defaultHTTPSPort)
-	log.Printf("HTTPS request from %s is routed to %s", client.RemoteAddr(), target)
+	appLog.Debugf("HTTPS request from %s is routed to %s", client.RemoteAddr(), target)
 	proxyConnection(client, target, initial, serverName, dialTimeout)
 }
 
 func proxyConnection(client net.Conn, target string, initial []byte, serverName string, dialTimeout time.Duration) {
 	upstream, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
-		log.Printf("Failed to connect to upstream %s for %s: %v", target, serverName, err)
+		appLog.Errorf("Failed to connect to upstream %s for %s: %v", target, serverName, err)
 		return
 	}
 	defer upstream.Close()
 
 	if _, err := upstream.Write(initial); err != nil {
-		log.Printf("Failed to write initial bytes to upstream %s: %v", target, err)
+		appLog.Errorf("Failed to write initial bytes to upstream %s: %v", target, err)
 		return
 	}
 

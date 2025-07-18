@@ -30,8 +30,19 @@ For local testing without privileged ports:
 ./sni-proxy -http-listen :8080 -https-listen :8443
 ```
 
+## Configuration
+
+By default, the proxy reads `config.yaml` from the current working directory. If the default file is missing, the proxy uses built-in defaults.
+
+```yaml
+log_level: info
+```
+
+Supported `log_level` values are `debug`, `info`, `warn`, and `error`. Per-request routing logs are printed only when `log_level` is `debug`.
+
 ## Flags
 
+- `-config`: YAML configuration file path, default `config.yaml`
 - `-http-listen`: HTTP listen address, default `:80`
 - `-https-listen`: HTTPS listen address, default `:443`
 - `-dial-timeout`: upstream TCP dial timeout, default `10s`

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/tls"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -73,4 +74,24 @@ func TestReadTLSClientHelloExtractsSNI(t *testing.T) {
 
 	_ = serverConn.Close()
 	<-done
+}
+
+func TestParseYAMLConfigReadsLogLevel(t *testing.T) {
+	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\n"))
+	if err != nil {
+		t.Fatalf("parseYAMLConfig returned an error: %v", err)
+	}
+	if cfg.LogLevel != levelDebug {
+		t.Fatalf("LogLevel = %v, want %v", cfg.LogLevel, levelDebug)
+	}
+}
+
+func TestParseYAMLConfigRejectsUnsupportedKeys(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("log_level: info\nlisten: :8080\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "unsupported configuration key") {
+		t.Fatalf("error = %q, want unsupported key error", err.Error())
+	}
 }

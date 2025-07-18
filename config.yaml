@@ -1,0 +1,2 @@
+# Supported values: debug, info, warn, error.
+log_level: info
