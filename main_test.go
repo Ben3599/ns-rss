@@ -76,13 +76,19 @@ func TestReadTLSClientHelloExtractsSNI(t *testing.T) {
 	<-done
 }
 
-func TestParseYAMLConfigReadsLogLevel(t *testing.T) {
-	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\n"))
+func TestParseYAMLConfigReadsLogLevelAndHosts(t *testing.T) {
+	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\nhosts:\n  Example.COM.: 203.0.113.10\n  ipv6.example.com: \"2001:db8::10\"\n"))
 	if err != nil {
 		t.Fatalf("parseYAMLConfig returned an error: %v", err)
 	}
 	if cfg.LogLevel != levelDebug {
 		t.Fatalf("LogLevel = %v, want %v", cfg.LogLevel, levelDebug)
+	}
+	if cfg.Hosts["example.com"] != "203.0.113.10" {
+		t.Fatalf("Hosts[example.com] = %q, want %q", cfg.Hosts["example.com"], "203.0.113.10")
+	}
+	if cfg.Hosts["ipv6.example.com"] != "2001:db8::10" {
+		t.Fatalf("Hosts[ipv6.example.com] = %q, want %q", cfg.Hosts["ipv6.example.com"], "2001:db8::10")
 	}
 }
 
@@ -93,5 +99,66 @@ func TestParseYAMLConfigRejectsUnsupportedKeys(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unsupported configuration key") {
 		t.Fatalf("error = %q, want unsupported key error", err.Error())
+	}
+}
+
+func TestParseYAMLConfigRejectsNonIPHostsValue(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("hosts:\n  example.com: upstream.example.net\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "must be an IP address") {
+		t.Fatalf("error = %q, want IP address error", err.Error())
+	}
+}
+
+func TestResolveTargetAddressUsesHostOverride(t *testing.T) {
+	resolved, overridden, err := resolveTargetAddress(
+		"example.com:8443",
+		"example.com",
+		map[string]string{"example.com": "203.0.113.10"},
+	)
+	if err != nil {
+		t.Fatalf("resolveTargetAddress returned an error: %v", err)
+	}
+	if !overridden {
+		t.Fatal("overridden = false, want true")
+	}
+	if resolved != "203.0.113.10:8443" {
+		t.Fatalf("resolved = %q, want %q", resolved, "203.0.113.10:8443")
+	}
+}
+
+func TestResolveTargetAddressSupportsIPv6HostOverride(t *testing.T) {
+	resolved, overridden, err := resolveTargetAddress(
+		"ipv6.example.com:443",
+		"ipv6.example.com",
+		map[string]string{"ipv6.example.com": "2001:db8::10"},
+	)
+	if err != nil {
+		t.Fatalf("resolveTargetAddress returned an error: %v", err)
+	}
+	if !overridden {
+		t.Fatal("overridden = false, want true")
+	}
+	if resolved != "[2001:db8::10]:443" {
+		t.Fatalf("resolved = %q, want %q", resolved, "[2001:db8::10]:443")
+	}
+}
+
+func TestResolveTargetAddressKeepsOriginalWhenHostIsMissing(t *testing.T) {
+	resolved, overridden, err := resolveTargetAddress(
+		"example.com:443",
+		"example.com",
+		map[string]string{"other.example.com": "203.0.113.10"},
+	)
+	if err != nil {
+		t.Fatalf("resolveTargetAddress returned an error: %v", err)
+	}
+	if overridden {
+		t.Fatal("overridden = true, want false")
+	}
+	if resolved != "example.com:443" {
+		t.Fatalf("resolved = %q, want %q", resolved, "example.com:443")
 	}
 }

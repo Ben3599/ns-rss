@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -44,6 +45,7 @@ const (
 var (
 	errNoServerName = errors.New("server name was not found")
 	errNeedMoreData = errors.New("more data is required")
+	appConfig       = defaultConfig()
 	appLog          = leveledLogger{level: levelInfo}
 )
 
@@ -53,6 +55,7 @@ type closeWriter interface {
 
 type config struct {
 	LogLevel logLevel
+	Hosts    map[string]string
 }
 
 type leveledLogger struct {
@@ -92,6 +95,7 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 	appLog = leveledLogger{level: cfg.LogLevel}
+	appConfig = cfg
 
 	httpListener, err := net.Listen("tcp", *httpListen)
 	if err != nil {
@@ -138,7 +142,10 @@ func defaultConfig() config {
 	if err != nil {
 		panic(err)
 	}
-	return config{LogLevel: level}
+	return config{
+		LogLevel: level,
+		Hosts:    map[string]string{},
+	}
 }
 
 func loadConfig(path string, required bool) (config, error) {
@@ -171,28 +178,49 @@ func parseYAMLConfig(data []byte) (config, error) {
 	scanner.Buffer(make([]byte, 1024), 64*1024)
 
 	lineNumber := 0
+	inHosts := false
 	for scanner.Scan() {
 		lineNumber++
-		line := strings.TrimSpace(stripYAMLComment(scanner.Text()))
-		if line == "" || line == "---" || line == "..." {
+		line := stripYAMLComment(scanner.Text())
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "" || trimmedLine == "---" || trimmedLine == "..." {
 			continue
 		}
 
-		key, value, ok := strings.Cut(line, ":")
+		indented := strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
+		if inHosts {
+			if indented {
+				if err := parseHostMappingLine(cfg.Hosts, trimmedLine, lineNumber); err != nil {
+					return cfg, err
+				}
+				continue
+			}
+			inHosts = false
+		}
+		if indented {
+			return cfg, fmt.Errorf("unexpected indentation on line %d", lineNumber)
+		}
+
+		key, value, ok := strings.Cut(trimmedLine, ":")
 		if !ok {
 			return cfg, fmt.Errorf("invalid YAML line %d", lineNumber)
 		}
 
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
-		if value == "" {
-			return cfg, fmt.Errorf("missing value for %q on line %d", key, lineNumber)
-		}
 
 		var err error
 		switch key {
 		case "log_level":
+			if value == "" {
+				return cfg, fmt.Errorf("missing value for %q on line %d", key, lineNumber)
+			}
 			cfg.LogLevel, err = parseLogLevel(unquoteYAMLScalar(value))
+		case "hosts":
+			if value != "" {
+				return cfg, fmt.Errorf("%q must be a mapping on line %d", key, lineNumber)
+			}
+			inHosts = true
 		default:
 			return cfg, fmt.Errorf("unsupported configuration key %q on line %d", key, lineNumber)
 		}
@@ -205,6 +233,31 @@ func parseYAMLConfig(data []byte) (config, error) {
 		return cfg, err
 	}
 	return cfg, nil
+}
+
+func parseHostMappingLine(hosts map[string]string, line string, lineNumber int) error {
+	host, address, ok := strings.Cut(line, ":")
+	if !ok {
+		return fmt.Errorf("invalid hosts mapping on line %d", lineNumber)
+	}
+
+	host, err := normalizeHostName(unquoteYAMLScalar(strings.TrimSpace(host)))
+	if err != nil {
+		return fmt.Errorf("invalid hosts key on line %d: %w", lineNumber, err)
+	}
+
+	address = unquoteYAMLScalar(strings.TrimSpace(address))
+	if address == "" {
+		return fmt.Errorf("missing hosts value for %q on line %d", host, lineNumber)
+	}
+
+	ip, err := netip.ParseAddr(address)
+	if err != nil {
+		return fmt.Errorf("invalid hosts value for %q on line %d: must be an IP address", host, lineNumber)
+	}
+
+	hosts[host] = ip.String()
+	return nil
 }
 
 func stripYAMLComment(line string) string {
@@ -263,6 +316,42 @@ func parseLogLevel(value string) (logLevel, error) {
 	}
 }
 
+func normalizeHostName(host string) (string, error) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if strings.HasSuffix(host, ".") {
+		host = strings.TrimSuffix(host, ".")
+	}
+	if host == "" {
+		return "", errors.New("host is empty")
+	}
+	if strings.ContainsAny(host, " \t\r\n/\\") {
+		return "", fmt.Errorf("host contains invalid characters: %s", host)
+	}
+	if strings.Contains(host, ":") {
+		return "", fmt.Errorf("host must not include a port: %s", host)
+	}
+	return host, nil
+}
+
+func resolveTargetAddress(target string, serverName string, hosts map[string]string) (string, bool, error) {
+	serverName = strings.ToLower(strings.TrimSpace(serverName))
+	if strings.HasSuffix(serverName, ".") {
+		serverName = strings.TrimSuffix(serverName, ".")
+	}
+
+	address, ok := hosts[serverName]
+	if !ok {
+		return target, false, nil
+	}
+
+	_, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", false, err
+	}
+
+	return net.JoinHostPort(address, port), true, nil
+}
+
 func serve(
 	listener net.Listener,
 	protocol string,
@@ -313,8 +402,18 @@ func handleHTTPConnection(client net.Conn, dialTimeout time.Duration, readTimeou
 		return
 	}
 
-	appLog.Debugf("HTTP request from %s is routed to %s", client.RemoteAddr(), target)
-	proxyConnection(client, target, initial, serverName, dialTimeout)
+	connectTarget, overridden, err := resolveTargetAddress(target, serverName, appConfig.Hosts)
+	if err != nil {
+		appLog.Errorf("Failed to resolve HTTP target %s from %s: %v", target, client.RemoteAddr(), err)
+		return
+	}
+
+	if overridden {
+		appLog.Debugf("HTTP request from %s is routed to %s via hosts target %s", client.RemoteAddr(), target, connectTarget)
+	} else {
+		appLog.Debugf("HTTP request from %s is routed to %s", client.RemoteAddr(), target)
+	}
+	proxyConnection(client, connectTarget, initial, serverName, dialTimeout)
 }
 
 func handleHTTPSConnection(client net.Conn, dialTimeout time.Duration, readTimeout time.Duration) {
@@ -337,8 +436,18 @@ func handleHTTPSConnection(client net.Conn, dialTimeout time.Duration, readTimeo
 	}
 
 	target := net.JoinHostPort(serverName, defaultHTTPSPort)
-	appLog.Debugf("HTTPS request from %s is routed to %s", client.RemoteAddr(), target)
-	proxyConnection(client, target, initial, serverName, dialTimeout)
+	connectTarget, overridden, err := resolveTargetAddress(target, serverName, appConfig.Hosts)
+	if err != nil {
+		appLog.Errorf("Failed to resolve HTTPS target %s from %s: %v", target, client.RemoteAddr(), err)
+		return
+	}
+
+	if overridden {
+		appLog.Debugf("HTTPS request from %s is routed to %s via hosts target %s", client.RemoteAddr(), target, connectTarget)
+	} else {
+		appLog.Debugf("HTTPS request from %s is routed to %s", client.RemoteAddr(), target)
+	}
+	proxyConnection(client, connectTarget, initial, serverName, dialTimeout)
 }
 
 func proxyConnection(client net.Conn, target string, initial []byte, serverName string, dialTimeout time.Duration) {

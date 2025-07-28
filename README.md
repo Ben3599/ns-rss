@@ -36,9 +36,15 @@ By default, the proxy reads `config.yaml` from the current working directory. If
 
 ```yaml
 log_level: info
+
+hosts:
+  example.com: 203.0.113.10
+  ipv6.example.com: "2001:db8::10"
 ```
 
 Supported `log_level` values are `debug`, `info`, `warn`, and `error`. Per-request routing logs are printed only when `log_level` is `debug`.
+
+The optional `hosts` map works like a small per-proxy hosts file. Keys are domain names, and values must be IP addresses. When a request host or SNI matches a configured domain, the proxy connects directly to that IP address and keeps the original port. For HTTPS, TLS is still passed through unchanged, so the client SNI remains the original domain.
 
 ## Flags
 
