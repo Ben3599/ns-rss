@@ -44,6 +44,10 @@ hosts:
 ip_family:
   example.com: ipv4
   ipv6.example.com: ipv6
+
+outbound_ip:
+  example.com: 198.51.100.20
+  ipv6.example.com: "2001:db8::20"
 ```
 
 Supported `log_level` values are `debug`, `info`, `warn`, and `error`. Per-request routing logs are printed only when `log_level` is `debug`.
@@ -51,6 +55,8 @@ Supported `log_level` values are `debug`, `info`, `warn`, and `error`. Per-reque
 The optional `hosts` map works like a small per-proxy hosts file. Keys are domain names, and values must be IP addresses. When a request host or SNI matches a configured domain, the proxy connects directly to that IP address and keeps the original port. For HTTPS, TLS is still passed through unchanged, so the client SNI remains the original domain.
 
 The optional `ip_family` map forces matching domains to use IPv4 or IPv6. Supported values are `ipv4` and `ipv6`. When used without a `hosts` entry, the proxy dials with `tcp4` or `tcp6`, which constrains DNS resolution to that address family. When used with `hosts`, the configured IP address must match the forced family.
+
+The optional `outbound_ip` map binds matching upstream connections to a specific local source IP address. This only affects outbound connections to upstream servers; the proxy still listens on all configured listen addresses. If `outbound_ip` is used with `ip_family` or `hosts`, all configured addresses for that domain must use the same IP family.
 
 ## Flags
 

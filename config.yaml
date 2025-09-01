@@ -7,3 +7,7 @@ hosts:
 ip_family:
   # example.com: ipv4
   # ipv6.example.com: ipv6
+
+outbound_ip:
+  # example.com: 198.51.100.20
+  # ipv6.example.com: 2001:db8::20

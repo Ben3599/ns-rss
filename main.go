@@ -64,6 +64,7 @@ type config struct {
 	LogLevel   logLevel
 	Hosts      map[string]string
 	IPFamilies map[string]ipFamily
+	OutboundIP map[string]string
 }
 
 type leveledLogger struct {
@@ -76,6 +77,7 @@ type routeTarget struct {
 	Network         string
 	HostsOverridden bool
 	IPFamily        ipFamily
+	OutboundIP      string
 }
 
 func (l leveledLogger) Debugf(format string, args ...any) {
@@ -162,6 +164,7 @@ func defaultConfig() config {
 		LogLevel:   level,
 		Hosts:      map[string]string{},
 		IPFamilies: map[string]ipFamily{},
+		OutboundIP: map[string]string{},
 	}
 }
 
@@ -216,6 +219,10 @@ func parseYAMLConfig(data []byte) (config, error) {
 					if err := parseIPFamilyMappingLine(cfg.IPFamilies, trimmedLine, lineNumber); err != nil {
 						return cfg, err
 					}
+				case "outbound_ip":
+					if err := parseOutboundIPMappingLine(cfg.OutboundIP, trimmedLine, lineNumber); err != nil {
+						return cfg, err
+					}
 				default:
 					return cfg, fmt.Errorf("unsupported configuration section %q on line %d", section, lineNumber)
 				}
@@ -252,6 +259,11 @@ func parseYAMLConfig(data []byte) (config, error) {
 				return cfg, fmt.Errorf("%q must be a mapping on line %d", key, lineNumber)
 			}
 			section = "ip_family"
+		case "outbound_ip":
+			if value != "" {
+				return cfg, fmt.Errorf("%q must be a mapping on line %d", key, lineNumber)
+			}
+			section = "outbound_ip"
 		default:
 			return cfg, fmt.Errorf("unsupported configuration key %q on line %d", key, lineNumber)
 		}
@@ -319,6 +331,31 @@ func parseIPFamilyMappingLine(families map[string]ipFamily, line string, lineNum
 	return nil
 }
 
+func parseOutboundIPMappingLine(outboundIP map[string]string, line string, lineNumber int) error {
+	host, address, ok := strings.Cut(line, ":")
+	if !ok {
+		return fmt.Errorf("invalid outbound_ip mapping on line %d", lineNumber)
+	}
+
+	host, err := normalizeHostName(unquoteYAMLScalar(strings.TrimSpace(host)))
+	if err != nil {
+		return fmt.Errorf("invalid outbound_ip key on line %d: %w", lineNumber, err)
+	}
+
+	address = unquoteYAMLScalar(strings.TrimSpace(address))
+	if address == "" {
+		return fmt.Errorf("missing outbound_ip value for %q on line %d", host, lineNumber)
+	}
+
+	ip, err := netip.ParseAddr(address)
+	if err != nil {
+		return fmt.Errorf("invalid outbound_ip value for %q on line %d: must be an IP address", host, lineNumber)
+	}
+
+	outboundIP[host] = ip.String()
+	return nil
+}
+
 func validateConfig(cfg config) error {
 	for host, family := range cfg.IPFamilies {
 		address, ok := cfg.Hosts[host]
@@ -327,6 +364,21 @@ func validateConfig(cfg config) error {
 		}
 		if err := validateAddressFamily(address, family); err != nil {
 			return fmt.Errorf("hosts value for %q conflicts with ip_family: %w", host, err)
+		}
+	}
+	for host, sourceIP := range cfg.OutboundIP {
+		sourceFamily, err := addressFamily(sourceIP)
+		if err != nil {
+			return fmt.Errorf("outbound_ip value for %q is invalid: %w", host, err)
+		}
+
+		if family, ok := cfg.IPFamilies[host]; ok && family != sourceFamily {
+			return fmt.Errorf("outbound_ip value for %q conflicts with ip_family: address %s is not %s", host, sourceIP, family)
+		}
+		if address, ok := cfg.Hosts[host]; ok {
+			if err := validateAddressFamily(address, sourceFamily); err != nil {
+				return fmt.Errorf("hosts value for %q conflicts with outbound_ip: %w", host, err)
+			}
 		}
 	}
 	return nil
@@ -458,6 +510,20 @@ func resolveRouteTarget(target string, serverName string, cfg config) (routeTarg
 		route.IPFamily = family
 		route.Network = family.network()
 	}
+	if sourceIP, ok := cfg.OutboundIP[serverName]; ok {
+		sourceFamily, err := addressFamily(sourceIP)
+		if err != nil {
+			return route, err
+		}
+		if route.IPFamily != familyAny && route.IPFamily != sourceFamily {
+			return route, fmt.Errorf("outbound IP %s does not match forced %s family", sourceIP, route.IPFamily)
+		}
+		if route.IPFamily == familyAny {
+			route.IPFamily = sourceFamily
+			route.Network = sourceFamily.network()
+		}
+		route.OutboundIP = sourceIP
+	}
 
 	address, ok := cfg.Hosts[serverName]
 	if !ok {
@@ -475,6 +541,20 @@ func resolveRouteTarget(target string, serverName string, cfg config) (routeTarg
 	route.DialTarget = net.JoinHostPort(address, port)
 	route.HostsOverridden = true
 	return route, nil
+}
+
+func addressFamily(address string) (ipFamily, error) {
+	ip, err := netip.ParseAddr(address)
+	if err != nil {
+		return familyAny, err
+	}
+	if ip.Is4() {
+		return familyIPv4, nil
+	}
+	if ip.Is6() {
+		return familyIPv6, nil
+	}
+	return familyAny, fmt.Errorf("address %s is not ipv4 or ipv6", address)
 }
 
 func validateAddressFamily(address string, family ipFamily) error {
@@ -496,6 +576,22 @@ func validateAddressFamily(address string, family ipFamily) error {
 }
 
 func logRoute(protocol string, clientAddr net.Addr, route routeTarget) {
+	if route.OutboundIP != "" && route.HostsOverridden && route.IPFamily != familyAny {
+		appLog.Debugf("%s request from %s is routed to %s via hosts target %s using %s from source %s", protocol, clientAddr, route.Target, route.DialTarget, route.IPFamily, route.OutboundIP)
+		return
+	}
+	if route.OutboundIP != "" && route.HostsOverridden {
+		appLog.Debugf("%s request from %s is routed to %s via hosts target %s from source %s", protocol, clientAddr, route.Target, route.DialTarget, route.OutboundIP)
+		return
+	}
+	if route.OutboundIP != "" && route.IPFamily != familyAny {
+		appLog.Debugf("%s request from %s is routed to %s using %s from source %s", protocol, clientAddr, route.Target, route.IPFamily, route.OutboundIP)
+		return
+	}
+	if route.OutboundIP != "" {
+		appLog.Debugf("%s request from %s is routed to %s from source %s", protocol, clientAddr, route.Target, route.OutboundIP)
+		return
+	}
 	if route.HostsOverridden && route.IPFamily != familyAny {
 		appLog.Debugf("%s request from %s is routed to %s via hosts target %s using %s", protocol, clientAddr, route.Target, route.DialTarget, route.IPFamily)
 		return
@@ -568,7 +664,7 @@ func handleHTTPConnection(client net.Conn, dialTimeout time.Duration, readTimeou
 	}
 
 	logRoute("HTTP", client.RemoteAddr(), route)
-	proxyConnection(client, route.Network, route.DialTarget, initial, serverName, dialTimeout)
+	proxyConnection(client, route, initial, serverName, dialTimeout)
 }
 
 func handleHTTPSConnection(client net.Conn, dialTimeout time.Duration, readTimeout time.Duration) {
@@ -598,23 +694,45 @@ func handleHTTPSConnection(client net.Conn, dialTimeout time.Duration, readTimeo
 	}
 
 	logRoute("HTTPS", client.RemoteAddr(), route)
-	proxyConnection(client, route.Network, route.DialTarget, initial, serverName, dialTimeout)
+	proxyConnection(client, route, initial, serverName, dialTimeout)
 }
 
-func proxyConnection(client net.Conn, network string, target string, initial []byte, serverName string, dialTimeout time.Duration) {
-	upstream, err := net.DialTimeout(network, target, dialTimeout)
+func proxyConnection(client net.Conn, route routeTarget, initial []byte, serverName string, dialTimeout time.Duration) {
+	localAddr, err := localTCPAddr(route.OutboundIP)
 	if err != nil {
-		appLog.Errorf("Failed to connect to upstream %s over %s for %s: %v", target, network, serverName, err)
+		appLog.Errorf("Failed to build outbound source address %s for %s: %v", route.OutboundIP, serverName, err)
+		return
+	}
+
+	dialer := net.Dialer{
+		Timeout:   dialTimeout,
+		LocalAddr: localAddr,
+	}
+	upstream, err := dialer.Dial(route.Network, route.DialTarget)
+	if err != nil {
+		appLog.Errorf("Failed to connect to upstream %s over %s for %s: %v", route.DialTarget, route.Network, serverName, err)
 		return
 	}
 	defer upstream.Close()
 
 	if _, err := upstream.Write(initial); err != nil {
-		appLog.Errorf("Failed to write initial bytes to upstream %s: %v", target, err)
+		appLog.Errorf("Failed to write initial bytes to upstream %s: %v", route.DialTarget, err)
 		return
 	}
 
 	pipeBidirectional(client, upstream)
+}
+
+func localTCPAddr(sourceIP string) (*net.TCPAddr, error) {
+	if sourceIP == "" {
+		return nil, nil
+	}
+
+	ip := net.ParseIP(sourceIP)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid IP address: %s", sourceIP)
+	}
+	return &net.TCPAddr{IP: ip}, nil
 }
 
 func pipeBidirectional(left net.Conn, right net.Conn) {

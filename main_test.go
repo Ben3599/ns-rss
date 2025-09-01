@@ -77,7 +77,7 @@ func TestReadTLSClientHelloExtractsSNI(t *testing.T) {
 }
 
 func TestParseYAMLConfigReadsLogLevelAndHosts(t *testing.T) {
-	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\nhosts:\n  Example.COM.: 203.0.113.10\n  ipv6.example.com: \"2001:db8::10\"\nip_family:\n  Example.COM.: ipv4\n  ipv6.example.com: ipv6\n"))
+	cfg, err := parseYAMLConfig([]byte("# Test configuration\nlog_level: \"debug\" # request logs\nhosts:\n  Example.COM.: 203.0.113.10\n  ipv6.example.com: \"2001:db8::10\"\nip_family:\n  Example.COM.: ipv4\n  ipv6.example.com: ipv6\noutbound_ip:\n  Example.COM.: 198.51.100.20\n  ipv6.example.com: \"2001:db8::20\"\n"))
 	if err != nil {
 		t.Fatalf("parseYAMLConfig returned an error: %v", err)
 	}
@@ -95,6 +95,12 @@ func TestParseYAMLConfigReadsLogLevelAndHosts(t *testing.T) {
 	}
 	if cfg.IPFamilies["ipv6.example.com"] != familyIPv6 {
 		t.Fatalf("IPFamilies[ipv6.example.com] = %v, want %v", cfg.IPFamilies["ipv6.example.com"], familyIPv6)
+	}
+	if cfg.OutboundIP["example.com"] != "198.51.100.20" {
+		t.Fatalf("OutboundIP[example.com] = %q, want %q", cfg.OutboundIP["example.com"], "198.51.100.20")
+	}
+	if cfg.OutboundIP["ipv6.example.com"] != "2001:db8::20" {
+		t.Fatalf("OutboundIP[ipv6.example.com] = %q, want %q", cfg.OutboundIP["ipv6.example.com"], "2001:db8::20")
 	}
 }
 
@@ -138,6 +144,36 @@ func TestParseYAMLConfigRejectsHostsAndIPFamilyMismatch(t *testing.T) {
 	}
 }
 
+func TestParseYAMLConfigRejectsInvalidOutboundIP(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("outbound_ip:\n  example.com: local.example.net\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "must be an IP address") {
+		t.Fatalf("error = %q, want IP address error", err.Error())
+	}
+}
+
+func TestParseYAMLConfigRejectsOutboundIPAndIPFamilyMismatch(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("ip_family:\n  example.com: ipv6\noutbound_ip:\n  example.com: 198.51.100.20\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "conflicts with ip_family") {
+		t.Fatalf("error = %q, want conflict error", err.Error())
+	}
+}
+
+func TestParseYAMLConfigRejectsHostsAndOutboundIPMismatch(t *testing.T) {
+	_, err := parseYAMLConfig([]byte("hosts:\n  example.com: 203.0.113.10\noutbound_ip:\n  example.com: 2001:db8::20\n"))
+	if err == nil {
+		t.Fatal("parseYAMLConfig returned nil error")
+	}
+	if !strings.Contains(err.Error(), "conflicts with outbound_ip") {
+		t.Fatalf("error = %q, want conflict error", err.Error())
+	}
+}
+
 func TestResolveRouteTargetUsesHostOverride(t *testing.T) {
 	route, err := resolveRouteTarget(
 		"example.com:8443",
@@ -145,6 +181,7 @@ func TestResolveRouteTargetUsesHostOverride(t *testing.T) {
 		config{
 			Hosts:      map[string]string{"example.com": "203.0.113.10"},
 			IPFamilies: map[string]ipFamily{},
+			OutboundIP: map[string]string{},
 		},
 	)
 	if err != nil {
@@ -168,6 +205,7 @@ func TestResolveRouteTargetSupportsIPv6HostOverride(t *testing.T) {
 		config{
 			Hosts:      map[string]string{"ipv6.example.com": "2001:db8::10"},
 			IPFamilies: map[string]ipFamily{},
+			OutboundIP: map[string]string{},
 		},
 	)
 	if err != nil {
@@ -188,6 +226,7 @@ func TestResolveRouteTargetKeepsOriginalWhenHostIsMissing(t *testing.T) {
 		config{
 			Hosts:      map[string]string{"other.example.com": "203.0.113.10"},
 			IPFamilies: map[string]ipFamily{},
+			OutboundIP: map[string]string{},
 		},
 	)
 	if err != nil {
@@ -208,6 +247,7 @@ func TestResolveRouteTargetUsesForcedIPv4(t *testing.T) {
 		config{
 			Hosts:      map[string]string{},
 			IPFamilies: map[string]ipFamily{"example.com": familyIPv4},
+			OutboundIP: map[string]string{},
 		},
 	)
 	if err != nil {
@@ -228,6 +268,7 @@ func TestResolveRouteTargetUsesForcedIPv6WithHostOverride(t *testing.T) {
 		config{
 			Hosts:      map[string]string{"ipv6.example.com": "2001:db8::10"},
 			IPFamilies: map[string]ipFamily{"ipv6.example.com": familyIPv6},
+			OutboundIP: map[string]string{},
 		},
 	)
 	if err != nil {
@@ -238,5 +279,66 @@ func TestResolveRouteTargetUsesForcedIPv6WithHostOverride(t *testing.T) {
 	}
 	if route.DialTarget != "[2001:db8::10]:443" {
 		t.Fatalf("DialTarget = %q, want %q", route.DialTarget, "[2001:db8::10]:443")
+	}
+}
+
+func TestResolveRouteTargetUsesOutboundIPv4(t *testing.T) {
+	route, err := resolveRouteTarget(
+		"example.com:443",
+		"Example.COM.",
+		config{
+			Hosts:      map[string]string{},
+			IPFamilies: map[string]ipFamily{},
+			OutboundIP: map[string]string{"example.com": "198.51.100.20"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolveRouteTarget returned an error: %v", err)
+	}
+	if route.Network != "tcp4" {
+		t.Fatalf("Network = %q, want %q", route.Network, "tcp4")
+	}
+	if route.OutboundIP != "198.51.100.20" {
+		t.Fatalf("OutboundIP = %q, want %q", route.OutboundIP, "198.51.100.20")
+	}
+	if route.DialTarget != "example.com:443" {
+		t.Fatalf("DialTarget = %q, want %q", route.DialTarget, "example.com:443")
+	}
+}
+
+func TestResolveRouteTargetUsesOutboundIPv6WithHostOverride(t *testing.T) {
+	route, err := resolveRouteTarget(
+		"ipv6.example.com:443",
+		"ipv6.example.com",
+		config{
+			Hosts:      map[string]string{"ipv6.example.com": "2001:db8::10"},
+			IPFamilies: map[string]ipFamily{},
+			OutboundIP: map[string]string{"ipv6.example.com": "2001:db8::20"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolveRouteTarget returned an error: %v", err)
+	}
+	if route.Network != "tcp6" {
+		t.Fatalf("Network = %q, want %q", route.Network, "tcp6")
+	}
+	if route.DialTarget != "[2001:db8::10]:443" {
+		t.Fatalf("DialTarget = %q, want %q", route.DialTarget, "[2001:db8::10]:443")
+	}
+	if route.OutboundIP != "2001:db8::20" {
+		t.Fatalf("OutboundIP = %q, want %q", route.OutboundIP, "2001:db8::20")
+	}
+}
+
+func TestLocalTCPAddrUsesSourceIP(t *testing.T) {
+	addr, err := localTCPAddr("198.51.100.20")
+	if err != nil {
+		t.Fatalf("localTCPAddr returned an error: %v", err)
+	}
+	if addr == nil {
+		t.Fatal("addr = nil, want TCP address")
+	}
+	if addr.IP.String() != "198.51.100.20" {
+		t.Fatalf("addr.IP = %q, want %q", addr.IP.String(), "198.51.100.20")
 	}
 }
